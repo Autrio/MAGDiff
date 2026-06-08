@@ -7,13 +7,15 @@ from magdiff.controller.osc_parallel import ParallelOSC, ArmSpec
 from magdiff.controller.render import WarpGridVideoRenderer
 from magdiff.grasp import ObjectLoader
 from magdiff.trajectory.bezier import BezierTrajectory
-from magdiff.parse import NWORLD, NWORLD_REND
+from magdiff.parse import NWORLD, NWORLD_REND, OUTFILE
+from magdiff.paths import RENDER_DIR
 
 import numpy as np
 
 
 loader = ObjectLoader(nworld=NWORLD,movable_object=True)
-base_model, warp_model, warp_data = loader.build(randomize=True,seed=28)
+# base_model, warp_model, warp_data = loader.build(randomize=True,seed=28)
+base_model, warp_model, warp_data = loader.build(indices=[0]*NWORLD, gr_indices=[-1]*NWORLD, seed=28)
 traj_gen = BezierTrajectory(nworld=NWORLD, nsteps=1000, device="cuda")
 
 left = ArmSpec(
@@ -99,7 +101,7 @@ traj_pos, traj_rot = traj_gen.generate(
     goal_pos_wp,
     start_rot_wp,
     goal_rot_wp,
-    sigma=0.2,
+    sigma=0.6,
 )
 
 traj = torch.cat([traj_pos, traj_rot], dim=-1)
@@ -116,10 +118,10 @@ width=640,
 height=480,
 )
 
-recorder.open("grasp_demo.mp4")
+recorder.open(RENDER_DIR/OUTFILE)
 
-for i in range(1000):
-    osc.step(traj[i])
+for i in range(2000):
+    osc.step(traj[i//2])
     MW.step(warp_model, warp_data)
     recorder.capture()
     

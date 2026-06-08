@@ -4,7 +4,8 @@ import mujoco_warp as MW
 from magdiff.controller.osc_parallel import ParallelOSC, ArmSpec
 from magdiff.controller.render import WarpGridVideoRenderer
 from magdiff.grasp import ObjectLoader
-from magdiff.parse import NWORLD, NWORLD_REND
+from magdiff.parse import NWORLD, NWORLD_REND, OUTFILE
+from magdiff.paths import RENDER_DIR
 
 import numpy as np
 
@@ -49,7 +50,7 @@ width=640,
 height=480,
 )
 
-recorder.open("grasp_demo.mp4")
+recorder.open(RENDER_DIR/OUTFILE)
 
 for _ in range(1000):
     osc.step()

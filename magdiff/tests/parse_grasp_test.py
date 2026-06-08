@@ -128,7 +128,7 @@ data = mujoco.MjData(model)
 model.vis.scale.framewidth = 0.01
 model.vis.scale.framelength = 0.4
 
-data.qpos[:21] = np.array([-0.08,-0.8,0.06,0.92,-7.8e-05,1.7,-0.036,0.003,0.003,0.0032,0.003,0.003,0.0032,-0.2,0.18,1.7,0.015,1.6,-0.19,-0.0002,0.0002], dtype=np.float64)
+# data.qpos[:21] = np.array([-0.08,-0.8,0.06,0.92,-7.8e-05,1.7,-0.036,0.003,0.003,0.0032,0.003,0.003,0.0032,-0.2,0.18,1.7,0.015,1.6,-0.19,-0.0002,0.0002], dtype=np.float64)
 mujoco.mj_forward(model, data)
 
 v = viewer.launch_passive(model, data)

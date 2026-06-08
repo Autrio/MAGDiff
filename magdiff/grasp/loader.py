@@ -4,6 +4,8 @@ import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+import glob
+import os
 
 import h5py
 import mujoco
@@ -16,6 +18,11 @@ from tqdm.auto import tqdm
 
 from magdiff.controller.render import WarpGridVideoRenderer, GridLayout
 from magdiff.paths import GRASP_DIR, MESH_DIR, GRIPPER_MESH_PATH, SCALES_JSON, WORLD_BASE_FILE
+
+import multiprocessing as mp
+import traceback
+from magdiff.grasp.acd import _acd_worker
+
 
 
 @dataclass
@@ -95,7 +102,7 @@ class ObjectLoader:
         mesh.apply_transform(T)
         mesh.export(self._gripper_temp)
 
-    def _load_sample(self, idx: int) -> WorldSample:
+    def _load_sample(self, idx: int, gr_idx:int) -> WorldSample:
         grasp_file = self.grasp_files[idx]
         base_name = Path(grasp_file).stem
         object_file = str(self.mesh_dir / f"{base_name}.obj")
@@ -109,7 +116,7 @@ class ObjectLoader:
 
         with h5py.File(grasp_file, "r") as f:
             grasps = f["grasps/grasps"][:]
-            grasp = grasps[-1]
+            grasp = grasps[-1] if gr_idx is None else grasps[gr_idx]
 
         return WorldSample(
             grasp_file=grasp_file,
@@ -118,22 +125,52 @@ class ObjectLoader:
             grasp=grasp,
         )
 
-    def _export_scaled_mesh(self, object_file: str, scale: float):
+    def _export_scaled_mesh(self, object_file: str, scale: float, max_convex_hull=5):
         key = (object_file, float(scale))
         if key in self._obj_mesh_temp:
             return self._obj_mesh_temp[key]
 
+        # Load once in the main process only to get metadata.
         mesh = trimesh.load(object_file, force="mesh")
         mesh.apply_translation(-mesh.centroid)
         mesh.apply_scale(scale * self.user_scale)
 
-        out_path = str(Path(self._tmpdir.name) / f"{Path(object_file).stem}_scaled.obj")
+        mesh_name = Path(object_file).stem
         pos = mesh.centroid.copy()
         bottom = float(mesh.bounds[0][2])
 
-        mesh.export(out_path)
-        self._obj_mesh_temp[key] = (out_path, pos, bottom)
-        return out_path, pos, bottom
+        out_dir = Path(object_file).parent / f"ACD/{mesh_name}"
+        num_parts = len(glob.glob(str(out_dir / "scaled_part*.obj")))
+
+        # Free the main-process mesh before launching CoACD.
+        del mesh
+        gc.collect()
+
+        if num_parts == 0:
+            ctx = mp.get_context("fork")
+            q = ctx.Queue(maxsize=1)
+            p = ctx.Process(
+                target=_acd_worker,
+                args=(
+                    object_file,
+                    scale,
+                    self.user_scale,
+                    str(out_dir),
+                    max_convex_hull,
+                    q,
+                ),
+            )
+            p.start()
+            status, payload = q.get()
+            p.join()
+
+            if status != "ok":
+                raise RuntimeError(f"CoACD failed for {object_file}:\n{payload}")
+
+            num_parts = int(payload)
+
+        self._obj_mesh_temp[key] = (mesh_name, pos, bottom, num_parts)
+        return mesh_name, pos, bottom, num_parts
 
     def _grasp_to_mocap_poses(self, grasp: np.ndarray, bottom: float):
         grasp1 = grasp[0] @ self.mj_frame_correction
@@ -154,7 +191,7 @@ class ObjectLoader:
             g2_quat.astype(np.float32),
         )
 
-    def _sample_worlds(self, indices=None, randomize=True, seed=None):
+    def _sample_worlds(self, indices=None, gr_indices=None, randomize=True, seed=None):
         rng = np.random.default_rng(seed)
 
         if indices is None:
@@ -162,25 +199,41 @@ class ObjectLoader:
                 indices = rng.integers(0, len(self.grasp_files), size=self.nworld).tolist()
             else:
                 indices = list(range(self.nworld))
+        if gr_indices is None:
+            if randomize:
+                gr_indices = rng.integers(0, 1000, size=self.nworld).tolist()
+            else:
+                gr_indices = [None] * self.nworld
 
         if len(indices) != self.nworld:
             raise ValueError(f"Expected {self.nworld} indices, got {len(indices)}")
 
-        samples = [self._load_sample(idx) for idx in indices]
+        samples = [self._load_sample(idx, gr_idx) for idx, gr_idx in zip(indices, gr_indices)]
         selected_object_files = list(dict.fromkeys(sample.object_file for sample in samples))
         return samples, selected_object_files
 
-    def _build_super_spec(self, selected_object_files):
+    def _build_super_spec(self, selected_object_files,max_convex_hull=50):
         spec = mujoco.MjSpec().from_file(self.world_base_file)
+        max_parts = 0
 
         for obj_file in tqdm(selected_object_files, desc="Processing sampled meshes"):
             base = Path(obj_file).stem
             scale = float(self.scales.get(base, 0.2))
-            scaled_path, pos, bottom = self._export_scaled_mesh(obj_file, scale)
+            mesh_name, pos, bottom, num_parts = self._export_scaled_mesh(obj_file, scale,max_convex_hull=max_convex_hull)
+            assert num_parts > 0, f"No parts found for {obj_file} after ACD processing"
+            assert mesh_name == base, f"Expected mesh name {base}, got {mesh_name}"
             self.pos_mesh_dict[base] = (pos, bottom)
-            mesh = spec.add_mesh()
-            mesh.name = base
-            mesh.file = scaled_path
+            for i in range(num_parts):
+                part_path = str(Path(obj_file).parent / f"ACD/{base}/scaled_part{i}.obj")
+                mesh = spec.add_mesh()
+                mesh.name = base + f"_scaled_part{i}"
+                mesh.file = part_path
+                
+            if num_parts > max_parts:
+                max_parts = num_parts
+                self.base_mesh_name = base
+                
+        print(f"Max parts across all meshes: {max_parts}")
 
         gripper_mesh = spec.add_mesh()
         gripper_mesh.name = "gripper_mesh"
@@ -190,18 +243,18 @@ class ObjectLoader:
         obj_body.name = "object"
         obj_body.pos = [0, 0, 0]
         obj_body.add_freejoint() if self.movable_object else None
-
-        obj_geom = obj_body.add_geom()
-        obj_geom.name = "object_geom"
-        obj_geom.type = mujoco.mjtGeom.mjGEOM_MESH
-
-        self.base_mesh_name = Path(selected_object_files[0]).stem
-        obj_geom.meshname = self.base_mesh_name
-
+        
+        for i in range(max_parts):
+            obj_geom = obj_body.add_geom()
+            obj_geom.type = mujoco.mjtGeom.mjGEOM_MESH
+            obj_geom.name = f"object_geom_part{i}"
+            obj_geom.meshname = self.base_mesh_name + f"_scaled_part{i}"
+            
         g1 = spec.worldbody.add_body()
         g1.name = "gripper1"
         g1.mocap = True
         g1_geom = g1.add_geom()
+        g1_geom.name = "gripper1_geom"
         g1_geom.type = mujoco.mjtGeom.mjGEOM_MESH
         g1_geom.meshname = "gripper_mesh"
         g1_geom.rgba = [1, 0, 0, 1]
@@ -212,6 +265,7 @@ class ObjectLoader:
         g2.name = "gripper2"
         g2.mocap = True
         g2_geom = g2.add_geom()
+        g2_geom.name = "gripper2_geom"
         g2_geom.type = mujoco.mjtGeom.mjGEOM_MESH
         g2_geom.meshname = "gripper_mesh"
         g2_geom.rgba = [0, 1, 0, 1]
@@ -223,7 +277,8 @@ class ObjectLoader:
 
     def _compile_variant(self, spec, mesh_name):
         """Compile a variant where the object geom points to a specific mesh."""
-        obj_geom = None
+        obj_geoms_old = []
+        geom_ids = []
         for body in spec.worldbody.bodies:
             if body.name == "object":
                 body.pos = [
@@ -231,23 +286,47 @@ class ObjectLoader:
                     self.pos_mesh_dict[mesh_name][0][1],
                     -self.pos_mesh_dict[mesh_name][1] + 0.03,
                 ]
+                #! HOLD UP
                 for g in body.geoms:
-                    if g.name == "object_geom":
-                        obj_geom = g
-                        break
-        if obj_geom is None:
+                    if "object_geom" in g.name:
+                        obj_geoms_old.append(g)
+        if not obj_geoms_old:
             raise RuntimeError("Could not find object_geom in spec")
 
-        obj_geom.meshname = mesh_name
+        for body in spec.worldbody.bodies:
+            for g in body.geoms:
+                if "object_geom" in g.name:
+                    part_id = int(g.name.split("part")[-1])
+                    if mesh_name + f"_scaled_part{part_id}" in [m.name for m in spec.meshes]:
+                        g.meshname = mesh_name + f"_scaled_part{part_id}"
+                        geom_ids.append(g.id)
+                    else:
+                        g.type = mujoco.mjtGeom.mjGEOM_SPHERE
+                        g.size = [0.000001,0,0]
+                        g.contype = 0
+                        g.conaffinity = 0
+                        g.mass=0
+                                  
+                
         model = spec.compile()
-        obj_geom.meshname = self.base_mesh_name  # restore
-        return model
+        
+        #restore
+        for body in spec.worldbody.bodies:
+            if body.name == "object":
+                for i,g in enumerate(body.geoms):
+                    g.meshname = self.base_mesh_name + f"_scaled_part{i}"
+                    g.type = mujoco.mjtGeom.mjGEOM_MESH
+                    g.contype = 1
+                    g.conaffinity = 1
+                    
+            
+        return model, geom_ids
 
     # ------------------------------------------------------------------
     # Build
     # ------------------------------------------------------------------
 
-    def build(self, indices=None, randomize=True, seed=None, verbose=False):
+    def build(self, indices=None, gr_indices=None, randomize=True, seed=None, verbose=False):
         """
         Sample worlds, compile per-mesh variants one at a time, and upload
         everything to the GPU.
@@ -263,6 +342,7 @@ class ObjectLoader:
         """
         samples, selected_object_files = self._sample_worlds(
             indices=indices,
+            gr_indices=gr_indices,
             randomize=randomize,
             seed=seed,
         )
@@ -270,7 +350,7 @@ class ObjectLoader:
         spec, base_model = self._build_super_spec(selected_object_files)
 
         m = MW.put_model(base_model)
-        d = MW.make_data(base_model, nworld=self.nworld, nconmax=200, njmax=300)
+        d = MW.make_data(base_model, nworld=self.nworld, nconmax=1000, njmax=1000)
 
         nw = self.nworld
         ng = base_model.ngeom
@@ -303,7 +383,12 @@ class ObjectLoader:
 
         # Resolve body / mocap IDs once up front.
         object_body_id = mujoco.mj_name2id(base_model, mujoco.mjtObj.mjOBJ_BODY, "object")
-        object_geom_id = base_model.body_geomadr[object_body_id]
+        geom_start = base_model.body_geomadr[object_body_id]
+        geom_count = base_model.body_geomnum[object_body_id]
+        geom_slice = slice(
+            geom_start,
+            geom_start + geom_count
+        )
         g1_body_id     = mujoco.mj_name2id(base_model, mujoco.mjtObj.mjOBJ_BODY, "gripper1")
         g2_body_id     = mujoco.mj_name2id(base_model, mujoco.mjtObj.mjOBJ_BODY, "gripper2")
         mocap1 = int(base_model.body(g1_body_id).mocapid[0])
@@ -323,17 +408,18 @@ class ObjectLoader:
             mesh_to_worlds[Path(sample.object_file).stem].append(w)
 
         for mesh_name, world_indices in tqdm(mesh_to_worlds.items(), desc="Building variants"):
-            variant = self._compile_variant(spec, mesh_name)
+            variant, geom_ids = self._compile_variant(spec, mesh_name)
 
             for w in world_indices:
                 sample = samples[w]
-                _, _, bottom = self._export_scaled_mesh(sample.object_file, sample.scale)
+                bottom = self.pos_mesh_dict[str(Path(sample.object_file).stem)][-1]
                 g1_pos, g1_quat, g2_pos, g2_quat = self._grasp_to_mocap_poses(
                     sample.grasp, bottom
                 )
 
                 # Geometry / inertia that differ per mesh.
-                geom_dataid[w, object_geom_id] = variant.geom_dataid[object_geom_id]
+                geom_dataid[w, geom_slice] = -1
+                geom_dataid[w, geom_ids] = variant.geom_dataid[geom_ids]
                 geom_size[w]        = variant.geom_size
                 geom_rbound[w]      = variant.geom_rbound
                 geom_aabb[w]        = variant.geom_aabb.reshape(ng, 2, 3)

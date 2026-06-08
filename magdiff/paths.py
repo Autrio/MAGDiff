@@ -13,3 +13,5 @@ SCALES_JSON = DATASET_DIR / "scales.json"
 
 MODELS_DIR = ROOT / "magdiff/models"
 WORLD_BASE_FILE = MODELS_DIR / "world.xml"
+
+RENDER_DIR = ROOT / "magdiff/renders"
