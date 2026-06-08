@@ -4,14 +4,16 @@ import mujoco_warp as MW
 from magdiff.controller.osc_parallel import ParallelOSC, ArmSpec
 from magdiff.controller.render import WarpGridVideoRenderer
 from magdiff.grasp import ObjectLoader
-from magdiff.parse import NWORLD, NWORLD_REND, OUTFILE
+from magdiff.trajectory.interface import Trajectory
+from magdiff.parse import NWORLD, NWORLD_REND, OUTFILE, NSTEPS
 from magdiff.paths import RENDER_DIR
 
 import numpy as np
 
 
 loader = ObjectLoader(nworld=NWORLD,movable_object=True)
-base_model, warp_model, warp_data = loader.build(randomize=True,seed=28)
+# base_model, warp_model, warp_data = loader.build(randomize=True,seed=28)
+base_model, warp_model, warp_data = loader.build(indices=[0]*NWORLD, gr_indices=[-1]*NWORLD, seed=28)
 
 left = ArmSpec(
         name="left",
@@ -39,6 +41,10 @@ right = ArmSpec(
 
 osc = ParallelOSC(warp_model, warp_data, [left, right], nworld=NWORLD)
 
+Tj_gen = Trajectory(base_model, warp_model, warp_data, [left, right], nworld=NWORLD, nsteps=NSTEPS//2, device="cuda")
+
+traj = Tj_gen.generate_random(profile="bezier", sigma=0.6)
+
 recorder = WarpGridVideoRenderer(
 base_model,
 warp_model,
@@ -52,8 +58,8 @@ height=480,
 
 recorder.open(RENDER_DIR/OUTFILE)
 
-for _ in range(1000):
-    osc.step()
+for i in range(NSTEPS):
+    osc.step(traj[i//2])
     MW.step(warp_model, warp_data)
     recorder.capture()
     
