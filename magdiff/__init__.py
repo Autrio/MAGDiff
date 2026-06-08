@@ -3,3 +3,4 @@ from .grasp import *
 from .paths import *
 from .parse import *
 from .trajectory import *
+from .telemetry import *

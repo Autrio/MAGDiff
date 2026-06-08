@@ -1,7 +1,7 @@
 import mujoco as MJ
 import mujoco_warp as MW
 
-from magdiff.controller.osc_parallel import ParallelOSC, ArmSpec
+from magdiff.controller.OSC import ParallelOSC, ArmSpec
 from magdiff.controller.render import WarpGridVideoRenderer
 from magdiff.grasp import ObjectLoader
 from magdiff.trajectory.interface import Trajectory

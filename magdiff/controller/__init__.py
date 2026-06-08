@@ -1,3 +1,2 @@
-from .osc_parallel import *
+from .OSC import *
 from .render import *
-from .analytics import *

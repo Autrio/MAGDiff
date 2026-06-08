@@ -3,7 +3,7 @@ import mujoco_warp as MW
 import warp as wp
 import torch
 
-from magdiff.controller.osc_parallel import ParallelOSC, ArmSpec
+from magdiff.controller.OSC import ParallelOSC, ArmSpec
 from magdiff.controller.render import WarpGridVideoRenderer
 from magdiff.grasp import ObjectLoader
 from magdiff.trajectory.bezier import BezierTrajectory
